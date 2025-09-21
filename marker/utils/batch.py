@@ -13,20 +13,38 @@ def get_batch_sizes_worker_counts(gpu_manager: GPUManager, peak_worker_vram: int
     device_mode = detect_device_mode()
     
     # Get VRAM for both paths
-    vram = gpu_manager.get_gpu_vram()
-    workers = max(1, vram // peak_worker_vram)
+    vram_gb = gpu_manager.get_gpu_vram()
+    vram_mb = vram_gb * 1024  # Convert GB to MB for precision calculations
+    workers = max(1, vram_gb // peak_worker_vram)
     
-    # For Intel XPU path, use VRAM-based calculations
+    # For Intel XPU path, use individual model VRAM requirements for precise batch sizing
     if is_intel_path(device_mode):
-        # Use VRAM-based workers value for batch sizes instead of hardcoded values
+        # Model VRAM requirements in MB (from task instructions)
+        model_vram_requirements = {
+            "layout": 220,      # layout: 220MB
+            "detection": 440,   # detection: 440MB
+            "table_rec": 150,   # table_rec: 150MB
+            "ocr_error": 200,   # ocr_error: 200MB
+            "recognition": 40,  # recognition: 40MB
+            "equation": 150,    # equation: 150MB
+        }
+        
+        # Calculate batch size for each model as max(1, vram_mb // model_vram_required)
+        batch_sizes = {}
+        for model_name, vram_required in model_vram_requirements.items():
+            batch_sizes[f"{model_name}_batch_size"] = max(1, vram_mb // vram_required)
+        
+        # For CPU workers, use max(1, vram_gb // 2)
+        cpu_workers = max(1, vram_gb // 2)
+        
         return {
-            "layout_batch_size": workers * 6,  # Scale base batch size of 6
-            "detection_batch_size": workers * 4,  # Scale base batch size of 4
-            "table_rec_batch_size": workers * 6,  # Scale base batch size of 6
-            "ocr_error_batch_size": workers * 6,  # Scale base batch size of 6
-            "recognition_batch_size": workers * 32,  # Scale base batch size of 32
-            "equation_batch_size": workers * 8,  # Scale base batch size of 8
-            "detector_postprocessing_cpu_workers": max(1, workers // 2),  # Scale CPU workers
+            "layout_batch_size": batch_sizes["layout_batch_size"],
+            "detection_batch_size": batch_sizes["detection_batch_size"],
+            "table_rec_batch_size": batch_sizes["table_rec_batch_size"],
+            "ocr_error_batch_size": batch_sizes["ocr_error_batch_size"],
+            "recognition_batch_size": batch_sizes["recognition_batch_size"],
+            "equation_batch_size": batch_sizes["equation_batch_size"],
+            "detector_postprocessing_cpu_workers": cpu_workers,
         }, workers
     
     # For NVIDIA path, use existing MPS behavior

@@ -176,24 +176,24 @@ def convert_cli(in_folder: str, **kwargs):
     total_processes = 1
     batch_sizes = {}
     
-    # For Intel XPU path, use continuous batching with single model
-    if is_intel_path(device_mode):
-        logger.info("Using Intel XPU path with continuous batching")
-        # Use single process for continuous batching
-        total_processes = 1
-        batch_sizes = {
-            "layout_batch_size": 6,
-            "detection_batch_size": 4,
-            "table_rec_batch_size": 6,
-            "ocr_error_batch_size": 6,
-            "recognition_batch_size": 32,
-            "equation_batch_size": 8,
-            "detector_postprocessing_cpu_workers": 1,
-        }
-    else:
-        # Use GPU context manager for automatic setup/cleanup (NVIDIA path)
-        with GPUManager(chunk_idx) as gpu_manager:
-            batch_sizes, workers = get_batch_sizes_worker_counts(gpu_manager, 7)
+    # Use GPU context manager for automatic setup/cleanup
+    with GPUManager(chunk_idx) as gpu_manager:
+        batch_sizes, workers = get_batch_sizes_worker_counts(gpu_manager, 7)
+        
+        # For Intel XPU path, use continuous batching with dynamic batch sizes
+        if is_intel_path(device_mode):
+            logger.info("Using Intel XPU path with continuous batching and dynamic batch sizes")
+            # Use single process for continuous batching with dynamic batch sizes
+            total_processes = 1
+            # Set proper batch sizes from GPUManager (dynamic based on VRAM) and thread counts
+            cpu_count = psutil.cpu_count(logical=False)
+            if cpu_count is not None:
+                kwargs["total_torch_threads"] = max(2, cpu_count // total_processes)
+            else:
+                kwargs["total_torch_threads"] = 2
+            # Update kwargs with dynamic batch sizes from GPUManager
+            kwargs.update(batch_sizes)
+        else:
 
             # Override workers if specified
             if kwargs["workers"] is not None:
@@ -217,10 +217,10 @@ def convert_cli(in_folder: str, **kwargs):
     # Generate config dict for workers
     worker_config_dict = ConfigParser(kwargs).generate_config_dict()
     
-    # For Intel XPU path, we don't use the GPUManager context or multiprocessing pool
+    # For Intel XPU path, we use the GPUManager context but with continuous batching and dynamic batch sizes
     if is_intel_path(device_mode):
-        # Process files sequentially for Intel XPU path
-        # Initialize models for sequential processing
+        # Process files sequentially for Intel XPU path with continuous batching
+        # Initialize models for sequential processing with dynamic batch sizes from GPUManager
         model_dict = create_model_dict(config=worker_config_dict)
         global model_refs
         model_refs = model_dict
@@ -235,6 +235,7 @@ def convert_cli(in_folder: str, **kwargs):
                 total_pages += 0
             pbar.update(1)
         pbar.close()
+        # Note: GPUManager context is automatically cleaned up by the 'with' statement
     else:
         # Use multiprocessing pool for NVIDIA path
         with mp.Pool(

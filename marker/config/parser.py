@@ -195,7 +195,7 @@ class ConfigParser:
             # We want to use LLM, so proceed
             service_cls = self.cli_options.get("llm_service", None)
             if service_cls is None:
-                service_cls = "marker.services.gemini.GoogleGeminiService"
+                service_cls = "marker.services.llama_cpp.LlamaCPPService"
             return service_cls
         else:
             # We don't want to use LLM

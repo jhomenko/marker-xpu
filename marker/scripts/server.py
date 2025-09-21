@@ -3,11 +3,19 @@ import uuid
 import click
 import os
 
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+os.environ["GLOG_minloglevel"] = "2"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = (
+    "1"  # Transformers uses .isin for a simple op, which is not supported on MPS
+)
+
 from pydantic import BaseModel, Field
 from starlette.responses import HTMLResponse
 
 from marker.config.parser import ConfigParser
 from marker.output import text_from_rendered
+from marker.logger import get_logger
+from marker.utils.device_mode import detect_device_mode, is_intel_path
 
 
 import base64
@@ -15,8 +23,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Annotated, Dict, Any
 import asyncio
 import io
-from fastapi import FastAPI, Form, File, UploadFile
-from marker.converters.pdf import PdfConverter
+from fastapi import FastAPI, Form, File, UploadFile, Depends, Header, HTTPException
 from marker.models import create_model_dict
 from marker.settings import settings
 
@@ -28,14 +35,39 @@ app_data = {}
 UPLOAD_DIRECTORY = "./uploads"
 os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 
+logger = get_logger()
+
+# API Key dependency
+async def verify_api_key(x_api_key: Annotated[Optional[str], Header()] = None):
+    if x_api_key is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing X-Api-Key header",
+        )
+    # For local/self-hosted deployments, accept any API key value without validation
+    return x_api_key
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app_data["models"] = create_model_dict(config={})
+    device_mode = detect_device_mode()
+    app_data["device_mode"] = device_mode
+    
+    # Create config dict with device-specific settings
+    config_dict = {
+        "device": device_mode,
+        "intel_batching": is_intel_path(device_mode)
+    }
+    
+    app_data["models"] = create_model_dict(device=device_mode, config=config_dict)
+    
+    logger.info(f"Server detected device mode: {device_mode}")
 
     yield
 
     if "models" in app_data:
+        from marker.models import cleanup_model_dict
+        cleanup_model_dict(app_data["models"])
         del app_data["models"]
 
 
@@ -135,8 +167,10 @@ async def _convert_pdf(params: CommonParams):
         options = params.model_dump()
         config_parser = ConfigParser(options)
         config_dict = config_parser.generate_config_dict()
-        config_dict["pdftext_workers"] = 1
-        converter_cls = PdfConverter
+        # Only set pdftext_workers=1 for non-Intel devices
+        if not is_intel_path(app_data.get("device_mode", "")):
+            config_dict["pdftext_workers"] = 1
+        converter_cls = config_parser.get_converter_cls()
         converter = converter_cls(
             config=config_dict,
             artifact_dict=app_data["models"],
@@ -226,7 +260,7 @@ async def process_conversion(request_id: str):
         }
         
         # Update the request storage with the result
-        request_storage[request_id]["status"] = "completed"
+        request_storage[request_id]["status"] = "complete"
         request_storage[request_id]["result"] = formatted_result
     except Exception as e:
         import traceback
@@ -238,10 +272,12 @@ async def process_conversion(request_id: str):
 
 @app.post("/api/v1/marker")
 async def convert_pdf_datalab_format(
+    api_key: str = Depends(verify_api_key),
     paginate: Optional[str] = Form(default="false"),
     output_format: Optional[str] = Form(default="markdown"),
     force_ocr: Optional[str] = Form(default="false"),
     use_llm: Optional[str] = Form(default="false"),
+    llm_service: Optional[str] = Form(default="marker.services.llama_cpp.LlamaCPPService"),
     strip_existing_ocr: Optional[str] = Form(default="false"),
     disable_image_extraction: Optional[str] = Form(default="false"),
     skip_cache: Optional[str] = Form(default="false"),
@@ -290,7 +326,32 @@ async def convert_pdf_datalab_format(
     asyncio.create_task(process_conversion(request_id))
     
     # Return initial response
-    request_check_url = f"http://localhost:8000/api/v1/marker/{request_id}"
+    # Construct the polling URL dynamically
+    server_host = app_data.get("server_host", "localhost")
+    server_port = app_data.get("server_port", 8000)
+    
+    # Check for environment variables to override URL generation
+    external_host = os.environ.get("MARKER_EXTERNAL_HOST")
+    external_port = os.environ.get("MARKER_EXTERNAL_PORT")
+    
+    if external_host:
+        url_host = external_host
+        url_port = int(external_port) if external_port else server_port
+    else:
+        # If host is "0.0.0.0", use "localhost" for the URL as "0.0.0.0" is not valid for clients
+        # Note: For external clients to access the server, the host should be set to the actual IP address
+        # of the server machine when starting the server, rather than "0.0"
+        if server_host == "0.0.0.0":
+            url_host = "localhost"
+        else:
+            url_host = server_host
+        url_port = server_port
+    
+    # Determine the scheme (for now, we'll assume http, but this could be enhanced)
+    # In a production environment, you might want to check for SSL certificates or environment variables
+    scheme = "http"
+    
+    request_check_url = f"{scheme}://{url_host}:{url_port}/api/v1/marker/{request_id}"
     return {
         "success": True,
         "error": None,
@@ -300,7 +361,7 @@ async def convert_pdf_datalab_format(
 
 
 @app.get("/api/v1/marker/{request_id}")
-async def get_conversion_result(request_id: str):
+async def get_conversion_result(request_id: str, api_key: str = Depends(verify_api_key)):
     # Check if request exists
     if request_id not in request_storage:
         return {
@@ -319,7 +380,7 @@ async def get_conversion_result(request_id: str):
         }
     
     # If completed, return result
-    if request_info["status"] == "completed":
+    if request_info["status"] == "complete":
         result = request_info["result"]
         # Clean up the stored file
         if os.path.exists(request_info["file_path"]):
@@ -352,6 +413,10 @@ async def get_conversion_result(request_id: str):
 @click.option("--host", type=str, default="0.0.0.0", help="Host to run the server on")
 def server_cli(port: int, host: str):
     import uvicorn
+    
+    # Store server host and port in app state
+    app_data["server_host"] = host
+    app_data["server_port"] = port
 
     # Run the server
     uvicorn.run(

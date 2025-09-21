@@ -1,0 +1,53 @@
+services:
+  marker-xpu:
+    build:
+      context: .          # directory containing Dockerfile
+      dockerfile: Dockerfile
+    # OR if using a pre-built image:
+    # image: marker-xpu:latest
+    container_name: marker-xpu
+    
+    # Intel Arc /dev/dri passthrough
+    devices:
+      - /dev/dri:/dev/dri
+    ports:
+      - "8015:8015"
+
+    # Direct host networking (same as reference)
+    # network_mode: host
+
+    # Keep SELinux/AppArmor quiet (matches upstream doc)
+    security_opt:
+      - label:disable
+
+    # volumes:
+      # Local volume for marker data
+      # - marker_data:/data
+
+    environment:
+      # Memory management
+      - MALLOC_ARENA_MAX=1
+      - PYTHONMALLOC=malloc
+      - TORCH_DEVICE=xpu
+      # External host for URL generation
+      - MARKER_EXTERNAL_HOST=192.168.68.186
+      - MARKER_EXTERNAL_PORT=8015
+
+    # Override the default command to launch the server
+    command: ["marker_server", "--host", "0.0.0.0", "--port", "8015"]
+    
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+
+
+# ─────────────────────── Volumes ──────────────────────────────
+volumes:
+  marker_data: {}
+
+networks: # <-- Add this section at the top level
+  default: # Define the default network if services refer to it explicitly
+    driver: bridge
+  sharednet: # Define the shared network as external
+    name: llm-net # Match the name used in 'docker network create'
+    external: true
